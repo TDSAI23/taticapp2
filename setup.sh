@@ -364,57 +364,123 @@ def add_canny_pre(graph: dict, image_src_id: str, low: int, high: int) -> str:
             return next_id
     return image_src_id
 
-def add_qwen2509_builtin_controlnet(
+def add_builtin_cn_with_aux(
     g: dict,
     *,
     vae_id: str,
-    cn_image_id: str,
-    ksampler_id: str,
-    positive_cond_id: str,
-    cn_mode: str,
+    cn_image_id: str,       # id of a LoadImage node that loads the CN image
+    ksampler_id: str,       # id of your KSampler node
+    positive_cond_id: str,  # id of your positive conditioning node
+    cn_mode: str,           # "edges" | "depth" | "keypoints"
     cn_strength: float = 1.0,
     cn_start: float = 0.0,
     cn_end: float = 1.0,
-):
-    # built-in modes
-    mode_map = {"edges":"edges","depth":"depth","keypoints":"keypoints"}
-    key = (cn_mode or "none").lower().strip()
-    if key not in mode_map: return
-    builtin_name = mode_map[key]
+) -> None:
+    """
+    Implements built-in CN types using comfyui_controlnet_aux preprocessors, then
+    ControlNetApplyAdvanced. Works even if Qwen-specific CN node isn't installed.
+    """
+    mode = (cn_mode or "none").strip().lower()
+    if mode not in ("edges", "depth", "keypoints"):
+        return
 
+    nodes = _object_info_nodes() or {}
+    def has_node(*cands): return next((c for c in cands if c in nodes), None)
+
+    # 1) Pick a preprocessor for the selected mode
+    pre_class = None
+    pre_inputs = {}
+
+    if mode == "edges":
+        # a few common names shipped by controlnet_aux
+        pre_class = has_node(
+            "CannyEdgePreprocessor", "CannyPreprocessor", "Canny", "CannyEdgeDetector"
+        )
+        if pre_class:
+            pre_inputs = {
+                # map common input names; fallbacks are tolerated by Comfy
+                "image": [cn_image_id, 0],
+                "low_threshold": 100,
+                "high_threshold": 200,
+            }
+
+    elif mode == "depth":
+        pre_class = has_node(
+            "DepthAnythingPreprocessor",
+            "DepthAnythingDetector",
+            "MidasDepthPreprocessor",
+            "LeReS-DepthMapPreprocessor",
+            "MiDaS-Depth Map Preprocessor",
+        )
+        if pre_class:
+            pre_inputs = {"image": [cn_image_id, 0]}
+
+    elif mode == "keypoints":
+        pre_class = has_node(
+            "DWPreprocessor", "DWposePreprocessor", "OpenposePreprocessor",
+            "OpenPosePreprocessor", "OpenPose"
+        )
+        if pre_class:
+            pre_inputs = {"image": [cn_image_id, 0]}
+
+    # 2) If we found a preprocessor, insert it and replace cn_image_id with its output
+    if pre_class:
+        next_id = str(max([int(i) for i in g.keys() if i.isdigit()] + [0]) + 1)
+        g[next_id] = {"class_type": pre_class, "inputs": pre_inputs}
+        cn_proc_id = next_id
+    else:
+        # no preprocessor available; just pass the raw CN image
+        cn_proc_id = cn_image_id
+
+    # 3) Loader + ApplyAdvanced
     base_id = max([int(i) for i in g.keys() if i.isdigit()] + [0]) + 1
     cn_loader_id  = str(base_id)
     cn_apply_id   = str(base_id + 1)
     cn_preview_id = str(base_id + 2)
 
-    # Loader (ONLY name)
+    # Loader: use the built-in name (“edges”/“depth”/“keypoints”) directly
     g[cn_loader_id] = {
         "class_type": "ControlNetLoaderAdvanced",
-        "inputs": { "control_net_name": builtin_name },
+        "inputs": {"control_net_name": mode}
     }
 
-    # preview raw CN image
+    # Optional: save the processed map for debugging/preview
     g[cn_preview_id] = {
         "class_type": "SaveImage",
-        "inputs": {"images": [cn_image_id, 0], "filename_prefix": "cn_preview"}
+        "inputs": {"images": [cn_proc_id, 0], "filename_prefix": "cn_preview"}
     }
 
-    # Apply (puts strength/start/end HERE)
-    g[cn_apply_id] = {
-        "class_type": "ControlNetApplyAdvanced",
-        "inputs": {
-            "positive":      [positive_cond_id, 0],
-            "control_net":   [cn_loader_id, 0],
-            "image":         [cn_image_id, 0],
-            "vae":           [vae_id, 0],
-            "strength":      float(cn_strength),
-            "start_percent": float(cn_start),
-            "end_percent":   float(cn_end),
-        },
-    }
+    # Introspect ApplyAdvanced so we set the right field names
+    info = nodes.get("ControlNetApplyAdvanced", {}) or {}
+    inputs_spec  = (info.get("input") or info.get("inputs") or {}) if isinstance(info, dict) else {}
+    outputs_spec = (info.get("output") or info.get("outputs") or {}) if isinstance(info, dict) else {}
 
-    # wire into sampler
+    def in_has(name):  return name in inputs_spec
+    def out_has(name): return name in outputs_spec
+
+    cn_inputs = {
+        "positive":      [positive_cond_id, 0],
+        "control_net":   [cn_loader_id, 0],
+        "image":         [cn_proc_id, 0],
+        "vae":           [vae_id, 0],
+        "strength":      float(cn_strength),
+        "start_percent": float(cn_start),
+        "end_percent":   float(cn_end),
+    }
+    # accept common aliases
+    if in_has("start"):        cn_inputs["start"] = cn_inputs.pop("start_percent")
+    if in_has("end"):          cn_inputs["end"]   = cn_inputs.pop("end_percent")
+    if in_has("cn_mode"):      cn_inputs["cn_mode"] = mode
+    if in_has("control_type"): cn_inputs["control_type"] = mode
+    if in_has("preprocess"):   cn_inputs["preprocess"] = True  # if supported, ensure “preprocess” path is chosen
+
+    g[cn_apply_id] = {"class_type": "ControlNetApplyAdvanced", "inputs": cn_inputs}
+
+    # Wire sampler
+    two_outs = out_has("negative") or (len({k.lower() for k in outputs_spec}) >= 2)
     g[ksampler_id]["inputs"]["positive"] = [cn_apply_id, 0]
+    if two_outs and "negative" in g[ksampler_id]["inputs"]:
+        g[ksampler_id]["inputs"]["negative"] = [cn_apply_id, 1]
 
 # -------- Helpers: history load/save --------
 
@@ -444,7 +510,248 @@ def add_hist(rec: dict) -> None:
             json.dump(items, w, ensure_ascii=False, indent=2)
     except Exception:
         pass
+# ---------------- Workflows ----------------
+def build_ideate(o: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    SDXL text2img:
+      CKPT[/VAE] -> CLIP encodes -> EmptyLatent -> KSampler -> VAEDecode -> Save
+    Optional ControlNets (2 slots), each with optional Canny preprocessing.
+    """
+    prompt   = o.get("prompt","")
+    negative = o.get("negative","")
+    steps    = int(float(o.get("steps",20)))
+    cfg      = float(o.get("cfg", 6.0))
+    sampler  = o.get("sampler","euler")
+    sched    = o.get("scheduler","normal")
+    seed     = int(float(o.get("seed", 0)))
+    width    = int(float(o.get("width", 1024)))
+    height   = int(float(o.get("height",1024)))
 
+    ckpt     = (o.get("ckpt") or "RealVisXL_V4.0.safetensors").strip()
+    vae_opt  = (o.get("vae")  or "").strip()
+
+    # Auto-pick "<ckpt>_vae.*" if present and user didn't set a VAE
+    if not vae_opt and ckpt:
+        base = os.path.splitext(ckpt)[0]
+        for ext in (".safetensors", ".ckpt"):
+            cand = f"{base}_vae{ext}"
+            if os.path.isfile(os.path.join(VAE_DIR, cand)):
+                vae_opt = cand
+                break
+
+    # ControlNet slot #1
+    c1_model = (o.get("c1_model") or "").strip()
+    c1_img   = (o.get("c1_image") or "").strip()
+    c1_w     = float(o.get("c1_weight", 1.0))
+    c1_s     = float(o.get("c1_start", 0.0))
+    c1_e     = float(o.get("c1_end",   1.0))
+    c1_pre   = bool(o.get("c1_preprocess", False))
+    c1_low   = int(float(o.get("c1_low", 100)))
+    c1_high  = int(float(o.get("c1_high",200)))
+
+    # ControlNet slot #2
+    c2_model = (o.get("c2_model") or "").strip()
+    c2_img   = (o.get("c2_image") or "").strip()
+    c2_w     = float(o.get("c2_weight", 1.0))
+    c2_s     = float(o.get("c2_start", 0.0))
+    c2_e     = float(o.get("c2_end",   1.0))
+    c2_pre   = bool(o.get("c2_preprocess", False))
+    c2_low   = int(float(o.get("c2_low", 100)))
+    c2_high  = int(float(o.get("c2_high",200)))
+
+    prefix   = (o.get("filename_prefix","ideate_sdxl") or "ideate_sdxl").strip()
+
+    # Base graph
+    g = {
+        "1": {"class_type":"CheckpointLoaderSimple",
+              "inputs":{"ckpt_name": ckpt, "vae_name": vae_opt}},
+        "2": {"class_type":"CLIPTextEncode",
+              "inputs":{"clip":["1",1], "text": prompt}},
+        "3": {"class_type":"CLIPTextEncode",
+              "inputs":{"clip":["1",1], "text": negative}},
+        "4": {"class_type":"EmptyLatentImage",
+              "inputs":{"width":width,"height":height,"batch_size":1}},
+        "5": {"class_type":"KSampler","inputs":{
+              "model":["1",0],"positive":["2",0],"negative":["3",0],
+              "latent_image":["4",0],
+              "seed":seed,"steps":steps,"cfg":cfg,
+              "sampler_name":sampler,"scheduler":sched,"denoise":1.0}},
+        "6": {"class_type":"VAEDecode",
+              "inputs":{"samples":["5",0],"vae":["1",2]}},
+        "7": {"class_type":"SaveImage",
+              "inputs":{"images":["6",0],"filename_prefix": prefix}}
+    }
+
+    # If user picked an explicit VAE, load and use it
+    if vae_opt:
+        g["10"] = {"class_type": "VAELoader", "inputs": {"vae_name": vae_opt}}
+        g["6"]["inputs"]["vae"] = ["10", 0]
+
+    def _vae_ref():
+        return ["10", 0] if "10" in g else ["1", 2]
+
+    # ControlNet plug helper
+    idx = 20
+    def plug_control(model_name, image_path, weight, start, end, pre, low, high):
+        nonlocal idx, g
+        if not (model_name and image_path):
+            return
+
+        g[str(idx)]   = {"class_type": "ControlNetLoader",
+                         "inputs": {"control_net_name": model_name}}
+        g[str(idx+1)] = {"class_type": "LoadImage",
+                         "inputs": {"image": image_path}}
+        image_src_id  = str(idx+1)
+
+        if pre:
+            image_src_id = add_canny_pre(g, image_src_id, low, high)
+
+        # Determine ControlNetApplyAdvanced IO names and wire up
+        info = _object_info_nodes().get("ControlNetApplyAdvanced", {}) or {}
+        inputs_spec  = (info.get("input") or info.get("inputs") or {})
+        outputs_spec = (info.get("output") or info.get("outputs") or {})
+        in_keys      = {k.lower() for k in inputs_spec.keys()} if isinstance(inputs_spec, dict) else set()
+        out_keys     = {k.lower() for k in outputs_spec.keys()} if isinstance(outputs_spec, dict) else set()
+
+        cn_inputs = {
+            "control_net":   [str(idx), 0],
+            "image":         [image_src_id, 0],
+            "strength":      weight,
+            "start_percent": start,
+            "end_percent":   end,
+            "vae":           _vae_ref(),
+        }
+        if "conditioning" in in_keys:
+            cn_inputs["conditioning"] = ["2", 0]  # use positive if single port
+        else:
+            cn_inputs["positive"] = ["2", 0]
+            cn_inputs["negative"] = ["3", 0]
+
+        g[str(idx+2)] = {"class_type": "ControlNetApplyAdvanced", "inputs": cn_inputs}
+
+        has_two_conditioning_out = ("negative" in out_keys) or (len(out_keys) >= 2)
+        g["5"]["inputs"]["positive"] = [str(idx+2), 0]
+        g["5"]["inputs"]["negative"] = [str(idx+2), 1] if has_two_conditioning_out else ["3", 0]
+
+        idx += 3
+
+    # Plug up to two CNs
+    plug_control(c1_model, c1_img, c1_w, c1_s, c1_e, c1_pre, c1_low, c1_high)
+    plug_control(c2_model, c2_img, c2_w, c2_s, c2_e, c2_pre, c2_low, c2_high)
+
+    return {"prompt": g}
+
+
+def build_render(o: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Qwen Image Edit 2509 (image-to-image):
+      LoadImage -> VAE/CLIP(Qwen) -> VAEEncode -> TextEncodeQwenImageEdit (preprocess) ->
+      KSampler (denoise) -> VAEDecode -> Save
+    Optional: UNET override, up to 2 LoRAs, optional built-in ControlNet (edges/depth/keypoints)
+              with a separate CN image.
+    """
+    prompt    = o.get("prompt", "")
+    negative  = o.get("negative", "")
+    steps     = int(float(o.get("steps", 5)))
+    cfg       = float(o.get("cfg", 1.0))
+    denoise   = float(o.get("denoise", 0.40))
+    prefix    = (o.get("filename_prefix", "render_qwen") or "render_qwen").strip()
+
+    # Input image must be reachable by ComfyUI LoadImage (we copy to BASE/input in /upload)
+    input_rel = os.path.basename(o.get("input_image", ""))
+    if not input_rel:
+        # Keep validation to the endpoint layer; return a minimal graph that will fail fast if hit directly.
+        input_rel = "MISSING_INPUT.png"
+
+    # UNET & dtype inference
+    unet_name = (o.get("unet_name") or "qwen_image_edit_fp8_e4m3fn.safetensors").strip()
+    _, udtype = _infer_qwen_unet_dtype(unet_name)
+
+    # LoRAs
+    l1, l1s = (o.get("lora1") or "").strip() or "Qwen-Image-Lightning-4steps-V1.0.safetensors", float(o.get("lora1_strength", 1.0))
+    l2, l2s = (o.get("lora2") or "").strip(), float(o.get("lora2_strength", 0.0))
+
+    # Base Qwen 2509 edit pipeline
+    g = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": input_rel}},
+        "2": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+        "3": {"class_type": "CLIPLoader", "inputs": {
+            "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+            "type": "qwen_image", "variant": "default"}},
+        "4": {"class_type": "UNETLoader", "inputs": {
+            "unet_name": unet_name, "weight_dtype": udtype}},
+    }
+
+    # LoRA chain on the model branch
+    model_ref = ["4", 0]
+    if l1:
+        g["5"] = {"class_type": "LoraLoaderModelOnly",
+                  "inputs": {"model": model_ref, "lora_name": l1, "strength_model": l1s}}
+        model_ref = ["5", 0]
+    if l2 and l2s > 0.0:
+        g["12"] = {"class_type": "LoraLoaderModelOnly",
+                   "inputs": {"model": model_ref, "lora_name": l2, "strength_model": l2s}}
+        model_ref = ["12", 0]
+
+    # Qwen “preprocessing”: TextEncodeQwenImageEdit consumes VAE + the input image
+    g["6"] = {"class_type": "TextEncodeQwenImageEdit",
+              "inputs": {"clip": ["3", 0], "vae": ["2", 0], "image": ["1", 0], "prompt": prompt}}
+
+    # Negative conditioning via CLIP
+    g["7"] = {"class_type": "CLIPTextEncode",
+              "inputs": {"clip": ["3", 0], "text": negative}}
+
+    # Latent of input
+    g["8"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["1", 0], "vae": ["2", 0]}}
+
+    # Sampler
+    g["9"] = {"class_type": "KSampler", "inputs": {
+        "model":        model_ref,
+        "positive":     ["6", 0],
+        "negative":     ["7", 0],
+        "latent_image": ["8", 0],
+        "seed": 0, "steps": steps, "cfg": cfg,
+        "sampler_name": "euler", "scheduler": "simple", "denoise": denoise,
+    }}
+
+    # Decode & save
+    g["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["2", 0]}}
+    g["11"] = {"class_type": "SaveImage", "inputs": {"images": ["10", 0], "filename_prefix": prefix}}
+
+    # Optional built-in ControlNet for Qwen 2509, using a SEPARATE CN image
+    cn_mode  = (o.get("cn_mode")  or "none").strip().lower()      # edges|depth|keypoints|none
+    cn_image = (o.get("cn_image") or "").strip()
+    cn_w     = float(o.get("cn_strength", 1.0))
+    cn_s     = float(o.get("cn_start", 0.0))
+    cn_e     = float(o.get("cn_end",   1.0))
+
+    if cn_image and cn_mode in ("edges", "depth", "keypoints"):
+        # Make sure CN image is available under BASE/input (the /upload route already copies there)
+        try:
+            src = os.path.join(BASE, "input", os.path.basename(cn_image))
+            if not os.path.isfile(src):
+                up = os.path.join(UPLOAD_DIR, os.path.basename(cn_image))
+                if os.path.isfile(up):
+                    with open(up, "rb") as r, open(src, "wb") as w:
+                        w.write(r.read())
+        except Exception:
+            pass
+
+        # Load CN image and apply built-in Qwen controlnet to the sampler’s positive branch
+        g["20"] = {"class_type": "LoadImage", "inputs": {"image": os.path.basename(cn_image)}}
+        add_builtin_cn_with_aux(
+            g,
+            vae_id="2",
+            cn_image_id="20",
+            ksampler_id="9",
+            positive_cond_id="6",
+            cn_mode=o.get("cn_mode","none"),
+            cn_strength=float(o.get("cn_strength",1.0)),
+            cn_start=float(o.get("cn_start",0.0)),
+            cn_end=float(o.get("cn_end",1.0)),
+        )
+
+    return {"prompt": g}
 
 # -------- Upscale workflow (SwinIR/ESRGAN class) --------
 
