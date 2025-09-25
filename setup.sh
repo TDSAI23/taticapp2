@@ -961,7 +961,7 @@ from fastapi.responses import HTMLResponse
 @app.get("/ui", response_class=HTMLResponse)
 def serve_ui():
     return HTMLResponse(HTML)
-PY   # <--- this closes the app.py heredoc
+PY
 
 # now back in bash, start services
 cd "$BASE"
@@ -971,8 +971,4 @@ cd "$APP_DIR"
 nohup "$VENVPY" -m uvicorn app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
 
 echo "ComfyUI running on :8188, UI running on :9999"
-EOF   # <--- this closes the setup.sh heredoc
-
-chmod +x /workspace/runpod-slim/setup.sh
-/workspace/runpod-slim/setup.sh
-'
+EOF
