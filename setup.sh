@@ -144,6 +144,71 @@ app.mount("/output", StaticFiles(directory=OUT_DIR), name="output")
 def health():
     return {"ok": True}
 
+# --- Minimal helpers & routes the UI expects ---
+
+# ensure upload dir
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(os.path.join(BASE, "input"), exist_ok=True)
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    # save to our uploads folder
+    name = f"{uuid.uuid4().hex}_{file.filename}"
+    save_path = os.path.join(UPLOAD_DIR, name)
+    with open(save_path, "wb") as w:
+        w.write(await file.read())
+    # also copy into ComfyUI/input so LoadImage can read it
+    try:
+        with open(save_path, "rb") as r, open(os.path.join(BASE, "input", name), "wb") as w:
+            w.write(r.read())
+    except Exception:
+        pass
+    # UI expects a preview URL
+    return {
+        "ok": True,
+        "path": save_path,
+        "comfy_rel": name,
+        "url": f"/view?filename={name}&type=input&subfolder="
+    }
+
+# serve images back to the UI (from ComfyUI folders)
+from fastapi.responses import FileResponse
+
+@app.get("/view")
+def view(filename: str, type: str = "output", subfolder: str = ""):
+    roots = {
+        "output": os.path.join(BASE, "output"),
+        "temp":   os.path.join(BASE, "temp"),
+        "input":  os.path.join(BASE, "input"),
+    }
+    root = roots.get(type, roots["output"])
+    if subfolder:
+        root = os.path.join(root, subfolder)
+    path = os.path.join(root, filename)
+    return FileResponse(path)
+
+# simple model listings the UI fills dropdowns with
+@app.get("/models/checkpoints")
+def list_ckpts():
+    return {"models": list_files(CHECKPOINTS_DIR, (".safetensors", ".ckpt"))}
+
+@app.get("/models/vae")
+def list_vae():
+    return {"models": list_files(VAE_DIR, (".safetensors", ".ckpt"))}
+
+@app.get("/models/upscalers")
+def list_upscalers():
+    return {"models": list_files(UPSCALE_DIR, (".pth",))}
+
+@app.get("/models/unets")
+def list_unets():
+    return {"models": list_files(DIFFUSION_DIR, (".safetensors", ".ckpt", ".bin"))}
+
+# UI sometimes calls this to “free” VRAM; just accept it
+@app.get("/models/unload")
+def unload_models():
+    return {"ok": True}
+
 CHECKPOINTS_DIR = os.path.join(BASE, "models", "checkpoints")
 VAE_DIR         = os.path.join(BASE, "models", "vae")
 UPSCALE_DIR     = os.path.join(BASE, "models", "upscale_models")
