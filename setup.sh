@@ -132,6 +132,12 @@ import websockets
 import cv2
 import numpy as np
 
+# --- Simple UI server bootstrap ---
+app = FastAPI()
+
+# Serve generated images directly (optional, handy for <img src="/output/...">)
+app.mount("/output", StaticFiles(directory=OUT_DIR), name="output")
+
 BASE = "/workspace/runpod-slim/ComfyUI"
 OUT_DIR = os.path.join(BASE, "output")
 HIST_FILE = os.path.join(BASE, "simple-ui", "history.json")
@@ -980,23 +986,24 @@ log('UI ready');
 # Serve the UI directly at /ui (root stays JSON health unless you prefer otherwise)
 from fastapi.responses import HTMLResponse
 
+# Basic healthcheck so you (and RunPod) can probe the service
 @app.get("/health")
 def health():
     return {"ok": True}
 
+# Serve the HTML UI that’s already stored in the HTML variable above
 @app.get("/ui", response_class=HTMLResponse)
 def serve_ui():
     return HTMLResponse(HTML)
 PY
 
-# now back in bash, start services
-# Start ComfyUI
+# --- Start ComfyUI ---
 cd "$BASE"
 nohup "$VENVPY" main.py --listen 0.0.0.0 --port 8188 >"$LOG" 2>&1 &
 
-# Start the Simple UI (FastAPI)
+# --- Start FastAPI UI ---
 cd "$BASE/simple-ui"
-nohup "$VENVPY" -m uvicorn app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
-
+"$VENV/bin/pip" show uvicorn fastapi >/dev/null || "$VENV/bin/pip" install --no-input fastapi uvicorn
+nohup "$VENV/bin/uvicorn" app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
 
 echo "ComfyUI running on :8188, UI running on :9999"
