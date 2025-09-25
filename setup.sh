@@ -14,15 +14,15 @@ VENVPY="$VENV/bin/python"
 PIP="$VENVPY -m pip"
 LOG="/workspace/runpod-slim/comfyui.log"
 
-# --- Ensure ComfyUI + venv exist BEFORE using $PIP/$VENVPY ---
+# --- Ensure ComfyUI exists and is set up ---
 if [ ! -d "$BASE" ]; then
-  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$BASE"
+  git clone https://github.com/comfyanonymous/ComfyUI.git "$BASE"
 fi
+mkdir -p "$BASE/custom_nodes"
 if [ ! -x "$VENVPY" ]; then
   python3 -m venv "$VENV"
 fi
 $PIP install --upgrade pip setuptools wheel
-# Base ComfyUI deps
 if [ -f "$BASE/requirements.txt" ]; then
   $PIP install --no-input -r "$BASE/requirements.txt"
 fi
