@@ -14,34 +14,36 @@ VENVPY="$VENV/bin/python"
 PIP="$VENVPY -m pip"
 LOG="/workspace/runpod-slim/comfyui.log"
 
-# --- Ensure ComfyUI exists and is set up ---
-if [ ! -d "$BASE" ]; then
-  git clone https://github.com/comfyanonymous/ComfyUI.git "$BASE"
+# --- Ensure git is available (best-effort) ---
+if ! command -v git >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  apt-get update -y || true
+  apt-get install -y git || true
 fi
-mkdir -p "$BASE/custom_nodes"
-if [ ! -x "$VENVPY" ]; then
+
+# --- Ensure ComfyUI repo is present (don’t skip just because $BASE exists) ---
+if [ ! -d "$BASE/.git" ]; then
+  rm -rf "$BASE"
+  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI.git "$BASE"
+fi
+
+# --- Ensure venv exists ---
+if [ ! -x "$VENV/bin/python" ]; then
   python3 -m venv "$VENV"
 fi
+
+# --- Base Python tooling + ComfyUI requirements ---
 $PIP install --upgrade pip setuptools wheel
 if [ -f "$BASE/requirements.txt" ]; then
   $PIP install --no-input -r "$BASE/requirements.txt"
 fi
 
-echo "== Using ComfyUI at $BASE =="
-$VENVPY -V
+# --- Ensure custom_nodes dir exists ---
+mkdir -p "$BASE/custom_nodes"
 
-# 1) Extra deps
-$PIP install --no-input piexif fastapi uvicorn websockets opencv-python
-
-# 2) Ensure model dirs (keep assets OUTSIDE HF repos)
-mkdir -p "$BASE/models/"{checkpoints,diffusion_models,text_encoders,vae,controlnet,upscale_models,loras}
-
-# Remove KJNodes (conflicts with Qwen workflows, not needed)
-rm -rf "$BASE/custom_nodes/ComfyUI-KJNodes"
-
-# 3) Custom nodes
-cd "$BASE/custom_nodes"
+# --- Custom nodes (idempotent clones + per-node requirements) ---
+cd "$BASE/custom_nodes" || { echo "ERROR: custom_nodes missing"; exit 1; }
 clone_if_absent(){ [ -d "$2" ] && echo "✓ $2 exists" || git clone --depth=1 "$1" "$2"; }
+
 clone_if_absent https://github.com/Fannovel16/comfyui_controlnet_aux.git comfyui_controlnet_aux
 clone_if_absent https://github.com/WASasquatch/was-node-suite-comfyui.git ComfyUI-WAS-NodeSuite
 clone_if_absent https://github.com/ltdrdata/ComfyUI-Impact-Pack.git ComfyUI-Impact-Pack
@@ -50,6 +52,10 @@ clone_if_absent https://github.com/yolain/ComfyUI-Easy-Use.git ComfyUI-Easy-Use
 clone_if_absent https://github.com/ltdrdata/ComfyUI-Manager.git ComfyUI-Manager
 clone_if_absent https://github.com/cubiq/ComfyUI_IPAdapter_plus.git ComfyUI_IPAdapter_plus
 
+# Remove KJNodes (conflicts / not needed)
+rm -rf "$BASE/custom_nodes/ComfyUI-KJNodes" || true
+
+# Per-node Python requirements (best effort)
 for d in "$BASE/custom_nodes"/*; do
   [ -f "$d/requirements.txt" ] && $PIP install --no-input -r "$d/requirements.txt" || true
 done
