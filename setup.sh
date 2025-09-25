@@ -14,6 +14,9 @@ VENVPY="$VENV/bin/python"
 PIP="$VENVPY -m pip"
 LOG="/workspace/runpod-slim/comfyui.log"
 
+# Make sure these exist before writing/reading files
+mkdir -p "$BASE/simple-ui" "$BASE/simple-ui/uploads" "$BASE/input" "$BASE/output"
+
 # --- Ensure git is available (best-effort) ---
 if ! command -v git >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
   apt-get update -y || true
@@ -33,6 +36,7 @@ fi
 
 # --- Base Python tooling + ComfyUI requirements ---
 $PIP install --upgrade pip setuptools wheel
+$PIP install --no-input fastapi uvicorn websockets piexif opencv-python
 if [ -f "$BASE/requirements.txt" ]; then
   $PIP install --no-input -r "$BASE/requirements.txt"
 fi
@@ -51,6 +55,10 @@ clone_if_absent https://github.com/Kosinkadink/ComfyUI-Advanced-ControlNet.git C
 clone_if_absent https://github.com/yolain/ComfyUI-Easy-Use.git ComfyUI-Easy-Use
 clone_if_absent https://github.com/ltdrdata/ComfyUI-Manager.git ComfyUI-Manager
 clone_if_absent https://github.com/cubiq/ComfyUI_IPAdapter_plus.git ComfyUI_IPAdapter_plus
+
+if [ ! -d "$BASE/.git" ]; then
+  echo "ERROR: ComfyUI repo not present at $BASE"; exit 1
+fi
 
 # Remove KJNodes (conflicts / not needed)
 rm -rf "$BASE/custom_nodes/ComfyUI-KJNodes" || true
@@ -972,16 +980,23 @@ log('UI ready');
 # Serve the UI directly at /ui (root stays JSON health unless you prefer otherwise)
 from fastapi.responses import HTMLResponse
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 @app.get("/ui", response_class=HTMLResponse)
 def serve_ui():
     return HTMLResponse(HTML)
 PY
 
 # now back in bash, start services
+# Start ComfyUI
 cd "$BASE"
 nohup "$VENVPY" main.py --listen 0.0.0.0 --port 8188 >"$LOG" 2>&1 &
 
-cd "$APP_DIR"
+# Start the Simple UI (FastAPI)
+cd "$BASE/simple-ui"
 nohup "$VENVPY" -m uvicorn app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
+
 
 echo "ComfyUI running on :8188, UI running on :9999"
