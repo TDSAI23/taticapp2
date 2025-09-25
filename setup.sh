@@ -36,7 +36,7 @@ fi
 
 # --- Base Python tooling + ComfyUI requirements ---
 $PIP install --upgrade pip setuptools wheel
-$PIP install --no-input fastapi uvicorn websockets piexif opencv-python
+$PIP install --no-input fastapi uvicorn websockets piexif opencv-python python-multipart
 if [ -f "$BASE/requirements.txt" ]; then
   $PIP install --no-input -r "$BASE/requirements.txt"
 fi
@@ -1069,7 +1069,7 @@ nohup "$VENVPY" main.py --listen 0.0.0.0 --port 8188 >"$LOG" 2>&1 &
 
 # --- Start FastAPI UI ---
 cd "$BASE/simple-ui"
-"$VENV/bin/pip" show uvicorn fastapi >/dev/null || "$VENV/bin/pip" install --no-input fastapi uvicorn
-nohup "$VENV/bin/uvicorn" app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
+"$VENV/bin/pip" show uvicorn fastapi >/dev/null || "$VENV/bin/pip" install --no-input fastapi uvicorn python-multipart
+nohup "$VENVPY" -m uvicorn app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
 
 echo "ComfyUI running on :8188, UI running on :9999"
