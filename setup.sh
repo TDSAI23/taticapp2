@@ -132,16 +132,17 @@ import websockets
 import cv2
 import numpy as np
 
-# --- Simple UI server bootstrap ---
-app = FastAPI()
-
-# Serve generated images directly (optional, handy for <img src="/output/...">)
-app.mount("/output", StaticFiles(directory=OUT_DIR), name="output")
-
 BASE = "/workspace/runpod-slim/ComfyUI"
 OUT_DIR = os.path.join(BASE, "output")
 HIST_FILE = os.path.join(BASE, "simple-ui", "history.json")
 UPLOAD_DIR = os.path.join(BASE, "simple-ui", "uploads")
+
+app = FastAPI()
+app.mount("/output", StaticFiles(directory=OUT_DIR), name="output")
+
+@app.get("/health")
+def health():
+    return {"ok": True}
 
 CHECKPOINTS_DIR = os.path.join(BASE, "models", "checkpoints")
 VAE_DIR         = os.path.join(BASE, "models", "vae")
