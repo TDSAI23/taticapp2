@@ -55,6 +55,19 @@ clone_if_absent https://github.com/cubiq/ComfyUI_IPAdapter_plus.git ComfyUI_IPAd
 # Remove KJNodes (conflicts / not needed)
 rm -rf "$BASE/custom_nodes/ComfyUI-KJNodes" || true
 
+# --- Native build deps needed by some custom nodes (pycairo/rlpycairo/svglib) ---
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -y || true
+  apt-get install -y \
+    build-essential \
+    pkg-config \
+    libcairo2-dev \
+    libffi-dev \
+    python3-dev \
+    meson \
+    ninja-build || true
+fi
+
 # Per-node Python requirements (best effort)
 for d in "$BASE/custom_nodes"/*; do
   [ -f "$d/requirements.txt" ] && $PIP install --no-input -r "$d/requirements.txt" || true
