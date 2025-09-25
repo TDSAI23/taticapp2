@@ -975,3 +975,4 @@ EOF   # <--- this closes the setup.sh heredoc
 
 chmod +x /workspace/runpod-slim/setup.sh
 /workspace/runpod-slim/setup.sh
+'
