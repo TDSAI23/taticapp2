@@ -98,6 +98,29 @@ if [ -d "$BASE/_hf/Qwen-Image-Edit-2509/transformer" ]; then
   ls -lh "$BASE/_hf/Qwen-Image-Edit-2509/transformer" | head -n 10 || true
 fi
 
+# ---- Qwen Image Edit 2509 (FP8 single file for ComfyUI) ----
+mkdir -p "$BASE/models/diffusion_models" "$BASE/models/text_encoders" "$BASE/models/vae"
+
+# Diffusion / UNet (2509 FP8)
+[ -f "$BASE/models/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors" ] || \
+curl -C - -L -o "$BASE/models/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors" \
+  "https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors"
+
+# (Optional) BF16 variant if you have the VRAM
+# [ -f "$BASE/models/diffusion_models/qwen_image_edit_2509_bf16.safetensors" ] || \
+# curl -C - -L -o "$BASE/models/diffusion_models/qwen_image_edit_2509_bf16.safetensors" \
+#   "https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2509_bf16.safetensors"
+
+# Text encoder (same as before)
+[ -f "$BASE/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors" ] || \
+curl -C - -L -o "$BASE/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors" \
+  "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"
+
+# VAE (same as before)
+[ -f "$BASE/models/vae/qwen_image_vae.safetensors" ] || \
+curl -C - -L -o "$BASE/models/vae/qwen_image_vae.safetensors" \
+  "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/main/split_files/vae/qwen_image_vae.safetensors"
+
 # ---- Download assets INTO $BASE/models/** (not inside HF repo) ----
 # RealVisXL v4.0
 [ -f "$BASE/models/checkpoints/RealVisXL_V4.0.safetensors" ] || \
