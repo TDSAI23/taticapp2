@@ -1,8 +1,3 @@
-bash -lc '
-set -e
-mkdir -p /workspace/runpod-slim
-# ---- paste your full setup.sh between the EOF markers ----
-cat >/workspace/runpod-slim/setup.sh << "EOF"
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -971,4 +966,3 @@ cd "$APP_DIR"
 nohup "$VENVPY" -m uvicorn app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
 
 echo "ComfyUI running on :8188, UI running on :9999"
-EOF
