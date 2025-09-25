@@ -143,6 +143,77 @@ app.mount("/output", StaticFiles(directory=OUT_DIR), name="output")
 @app.get("/health")
 def health():
     return {"ok": True}
+    
+# -------- extra endpoints the UI expects --------
+
+# simple list of ControlNet “models”: include built-ins and anything on disk
+@app.get("/models/controlnets")
+def list_controlnets():
+    builtins = ["edges", "depth", "keypoints"]
+    disk = list_files(CONTROLNET_DIR, (".safetensors", ".pth", ".onnx"))
+    return {"models": builtins + disk}
+
+# proxy history to Comfy so the UI can poll images by prompt_id
+@app.get("/history/{pid}")
+def get_history(pid: str):
+    status, data = comfy_request("GET", f"/history/{pid}")
+    return JSONResponse(data, status_code=status)
+
+# allow the UI to persist a tiny history file (best-effort)
+@app.post("/history/save")
+async def history_save(req: Request):
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    items = []
+    try:
+        if os.path.isfile(HIST_FILE):
+            with open(HIST_FILE, "r", encoding="utf-8") as r:
+                items = json.load(r) or []
+    except Exception:
+        pass
+    body["ts"] = int(time.time())
+    items.append(body)
+    try:
+        os.makedirs(os.path.dirname(HIST_FILE), exist_ok=True)
+        with open(HIST_FILE, "w", encoding="utf-8") as w:
+            json.dump(items, w, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return {"ok": True}
+
+# minimal /render: queue a tiny Comfy graph so the UI sees a prompt_id
+# It just loads the input image and re-saves it, proving end-to-end works.
+@app.post("/render")
+async def render_min(req: Request):
+    payload = await req.json()
+    overrides = payload.get("overrides", {}) or {}
+    client_id = payload.get("client_id") or uuid.uuid4().hex
+
+    rel = os.path.basename(overrides.get("input_image") or "")
+    if not rel:
+        return JSONResponse({"error": "input_image required"}, status_code=400)
+
+    graph = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": rel}},
+        "2": {"class_type": "SaveImage",
+              "inputs": {"images": ["1", 0],
+                         "filename_prefix": overrides.get("filename_prefix", "render_min")}}
+    }
+    status, data = comfy_request("POST", "/prompt", {"prompt": graph, "client_id": client_id})
+    # Comfy returns {"prompt_id": "..."} on success
+    return JSONResponse(data if isinstance(data, dict) else {"status": status}, status_code=status)
+
+# very lightweight websocket so UI can connect without 403
+@app.websocket("/ws")
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            await asyncio.sleep(30)
+    except WebSocketDisconnect:
+        pass
 
 # --- Minimal helpers & routes the UI expects ---
 
