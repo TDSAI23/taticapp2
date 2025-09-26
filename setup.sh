@@ -206,26 +206,35 @@ async def history_save(req: Request):
         pass
     return {"ok": True}
 
-# minimal /render: queue a tiny Comfy graph so the UI sees a prompt_id
-# It just loads the input image and re-saves it, proving end-to-end works.
-@app.post("/render")
-async def render_min(req: Request):
-    payload = await req.json()
+@app.post("/ideate")
+async def ideate(req: Request):
+    payload   = await req.json()
     overrides = payload.get("overrides", {}) or {}
     client_id = payload.get("client_id") or uuid.uuid4().hex
+    g = build_ideate(overrides)
+    status, data = comfy_request("POST", "/prompt", {"prompt": g["prompt"], "client_id": client_id})
+    return JSONResponse(data if isinstance(data, dict) else {"status": status}, status_code=status)
 
-    rel = os.path.basename(overrides.get("input_image") or "")
-    if not rel:
-        return JSONResponse({"error": "input_image required"}, status_code=400)
+@app.post("/render")
+async def render_qwen(req: Request):
+    payload   = await req.json()
+    overrides = payload.get("overrides", {}) or {}
+    client_id = payload.get("client_id") or uuid.uuid4().hex
+    g = build_render(overrides)
+    status, data = comfy_request("POST", "/prompt", {"prompt": g["prompt"], "client_id": client_id})
+    return JSONResponse(data if isinstance(data, dict) else {"status": status}, status_code=status)
 
-    graph = {
-        "1": {"class_type": "LoadImage", "inputs": {"image": rel}},
-        "2": {"class_type": "SaveImage",
-              "inputs": {"images": ["1", 0],
-                         "filename_prefix": overrides.get("filename_prefix", "render_min")}}
-    }
-    status, data = comfy_request("POST", "/prompt", {"prompt": graph, "client_id": client_id})
-    # Comfy returns {"prompt_id": "..."} on success
+@app.post("/upscale")
+async def upscale(req: Request):
+    payload = await req.json()
+    client_id = payload.get("client_id") or uuid.uuid4().hex
+    path = payload.get("path") or ""
+    model_name = payload.get("model_name") or ""
+    prefix = payload.get("prefix") or "upscaled"
+    if not (path and model_name):
+        return JSONResponse({"error":"path and model_name required"}, status_code=400)
+    g = build_upscale(path, model_name, prefix=prefix)
+    status, data = comfy_request("POST", "/prompt", {"prompt": g["prompt"], "client_id": client_id})
     return JSONResponse(data if isinstance(data, dict) else {"status": status}, status_code=status)
 
 # very lightweight websocket so UI can connect without 403
@@ -664,6 +673,19 @@ def build_ideate(o: Dict[str, Any]) -> Dict[str, Any]:
 
     return {"prompt": g}
 
+def _infer_qwen_unet_dtype(unet_name: str):
+    """
+    Guess the correct UNet weight dtype enum for UNETLoader.
+    Returns (tag, comfy_dtype), comfy_dtype is what UNETLoader expects.
+    """
+    n = (unet_name or "").lower()
+    if "fp8" in n:
+        return ("fp8", "fp8_e4m3fn")
+    if "bf16" in n or "bfloat16" in n:
+        return ("bf16", "bf16")
+    if "fp16" in n or "half" in n:
+        return ("fp16", "fp16")
+    return ("default", "default")
 
 def build_render(o: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -687,7 +709,7 @@ def build_render(o: Dict[str, Any]) -> Dict[str, Any]:
         input_rel = "MISSING_INPUT.png"
 
     # UNET & dtype inference
-    unet_name = (o.get("unet_name") or "qwen_image_edit_fp8_e4m3fn.safetensors").strip()
+    unet_name = (o.get("unet_name") or "qwen_image_edit_2509_fp8_e4m3fn.safetensors").strip()
     _, udtype = _infer_qwen_unet_dtype(unet_name)
 
     # LoRAs
@@ -716,10 +738,15 @@ def build_render(o: Dict[str, Any]) -> Dict[str, Any]:
                    "inputs": {"model": model_ref, "lora_name": l2, "strength_model": l2s}}
         model_ref = ["12", 0]
 
-    # Qwen “preprocessing”: TextEncodeQwenImageEdit consumes VAE + the input image
-    g["6"] = {"class_type": "TextEncodeQwenImageEdit",
-              "inputs": {"clip": ["3", 0], "vae": ["2", 0], "image": ["1", 0], "prompt": prompt}}
+    # Robustly map the text field name for the Qwen edit encoder
+    _qwen_nodes = _object_info_nodes()
+    _qie_info   = _qwen_nodes.get("TextEncodeQwenImageEdit", {}) if isinstance(_qwen_nodes, dict) else {}
+    _qie_inputs = (_qie_info.get("input") or _qie_info.get("inputs") or {}) if isinstance(_qie_info, dict) else {}
+    _text_field = "text" if "text" in _qie_inputs else ("prompt" if "prompt" in _qie_inputs else "text")
 
+    g["6"] = {"class_type": "TextEncodeQwenImageEdit",
+          "inputs": {"clip": ["3", 0], "vae": ["2", 0], "image": ["1", 0], _text_field: prompt}}
+          
     # Negative conditioning via CLIP
     g["7"] = {"class_type": "CLIPTextEncode",
               "inputs": {"clip": ["3", 0], "text": negative}}
