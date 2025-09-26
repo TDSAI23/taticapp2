@@ -16,6 +16,13 @@ LOG="/workspace/runpod-slim/comfyui.log"
 
 # Make sure these exist before writing/reading files
 mkdir -p "$BASE/simple-ui" "$BASE/simple-ui/uploads" "$BASE/input" "$BASE/output"
+mkdir -p "$BASE/models/diffusion_models" \
+         "$BASE/models/text_encoders" \
+         "$BASE/models/vae" \
+         "$BASE/models/controlnet" \
+         "$BASE/models/checkpoints" \
+         "$BASE/models/upscale_models" \
+         "$BASE/models/loras"
 
 # --- Ensure git is available (best-effort) ---
 if ! command -v git >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
@@ -88,15 +95,6 @@ if command -v apt-get >/dev/null 2>&1; then
 fi
 git lfs install || true
 
-# ---- (Docs only) Clone the HF repo OUTSIDE models ----
-mkdir -p "$BASE/_hf"
-if [ ! -d "$BASE/_hf/Qwen-Image-Edit-2509" ]; then
-  git clone https://huggingface.co/Qwen/Qwen-Image-Edit-2509 "$BASE/_hf/Qwen-Image-Edit-2509" || true
-fi
-if [ -d "$BASE/_hf/Qwen-Image-Edit-2509/transformer" ]; then
-  ls -lh "$BASE/_hf/Qwen-Image-Edit-2509/transformer" | head -n 10 || true
-fi
-
 # ---- Qwen Image Edit 2509 (FP8 single file for ComfyUI) ----
 mkdir -p "$BASE/models/diffusion_models" "$BASE/models/text_encoders" "$BASE/models/vae"
 
@@ -105,10 +103,10 @@ mkdir -p "$BASE/models/diffusion_models" "$BASE/models/text_encoders" "$BASE/mod
 curl -C - -L -o "$BASE/models/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors" \
   "https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors"
 
-# (Optional) BF16 variant if you have the VRAM
-# [ -f "$BASE/models/diffusion_models/qwen_image_edit_2509_bf16.safetensors" ] || \
-# curl -C - -L -o "$BASE/models/diffusion_models/qwen_image_edit_2509_bf16.safetensors" \
-#   "https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI/resolve/main/split_files/diffusion_models/qwen_image_edit_2509_bf16.safetensors"
+# InstantX ControlNet Union  (FIXED: add $BASE/)
+[ -f "$BASE/models/controlnet/Qwen-Image-InstantX-ControlNet-Union.safetensors" ] || \
+curl -C - -L -o "$BASE/models/controlnet/Qwen-Image-InstantX-ControlNet-Union.safetensors" \
+  "https://huggingface.co/Comfy-Org/Qwen-Image-InstantX-ControlNets/resolve/main/split_files/controlnet/Qwen-Image-InstantX-ControlNet-Union.safetensors"
 
 # Text encoder (same as before)
 [ -f "$BASE/models/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors" ] || \
@@ -149,10 +147,8 @@ from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from PIL import Image
 import websockets
-import cv2
-import numpy as np
+import shutil
 
 BASE = "/workspace/runpod-slim/ComfyUI"
 OUT_DIR = os.path.join(BASE, "output")
@@ -252,6 +248,59 @@ async def ws_endpoint(ws: WebSocket):
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(os.path.join(BASE, "input"), exist_ok=True)
 
+@app.post("/cn/preprocess")
+async def cn_preprocess(req: Request):
+    body = await req.json()
+    mode = (body.get("cn_mode") or "none").strip().lower()
+    img_rel = os.path.basename(body.get("cn_image") or "")
+    low = int(body.get("canny_low", 100))
+    high = int(body.get("canny_high", 200))
+
+    if mode not in ("edges", "depth", "keypoints") or not img_rel:
+        return JSONResponse({"ok": False, "error": "invalid input"}, status_code=400)
+
+    # Build a tiny Comfy graph: LoadImage -> (preprocessor) -> SaveImage(prefix='cn_preview')
+    g = {"1": {"class_type": "LoadImage", "inputs": {"image": img_rel}}}
+
+    nodes = _object_info_nodes() or {}
+    def pick(*names):
+        for n in names:
+            if n in nodes: return n
+        return None
+
+    if mode == "edges":
+        pre = pick("CannyEdgePreprocessor", "CannyPreprocessor", "Canny", "CannyEdgeDetector")
+        inputs = {"image": ["1",0], "low_threshold": low, "high_threshold": high}
+    elif mode == "depth":
+        pre = pick("DepthAnythingPreprocessor", "DepthAnythingDetector", "MidasDepthPreprocessor", "LeReS-DepthMapPreprocessor")
+        inputs = {"image": ["1",0]}
+    else:  # keypoints
+        pre = pick("DWPreprocessor", "DWposePreprocessor", "OpenposePreprocessor", "OpenPosePreprocessor", "OpenPose")
+        inputs = {"image": ["1",0]}
+
+    src_id = "1"
+    if pre:
+        g["2"] = {"class_type": pre, "inputs": inputs}
+        src_id = "2"
+
+    g["3"] = {"class_type": "SaveImage", "inputs": {"images": [src_id,0], "filename_prefix": "cn_preview"}}
+
+    status, data = comfy_request("POST", "/prompt", {"prompt": g, "client_id": uuid.uuid4().hex})
+    if status != 200 or not isinstance(data, dict) or "prompt_id" not in data:
+        return JSONResponse({"ok": False, "error": "comfy rejected"}, status_code=500)
+
+    im = _first_hist_image(data["prompt_id"], 60)
+    if not im:
+        return JSONResponse({"ok": False, "error": "no preview"}, status_code=504)
+
+    rel = _copy_output_to_input(im)  # copy preview into /input so it can be used as CN map
+    preview_url = f"/view?filename={urllib.parse.quote(im['filename'])}&type=output&subfolder={urllib.parse.quote(im.get('subfolder',''))}"
+    return {"ok": True, "cn_proc_rel": rel or "", "preview_url": preview_url}
+
+@app.get("/history/list")
+def history_list():
+    return {"items": list(reversed(load_hist()))}
+
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     # save to our uploads folder
@@ -284,9 +333,9 @@ def view(filename: str, type: str = "output", subfolder: str = ""):
         "input":  os.path.join(BASE, "input"),
     }
     root = roots.get(type, roots["output"])
-    if subfolder:
-        root = os.path.join(root, subfolder)
-    path = os.path.join(root, filename)
+    filename = os.path.basename(filename)
+    subfolder = os.path.normpath(subfolder).lstrip("./\\")
+    path = os.path.join(root, subfolder, filename) if subfolder else os.path.join(root, filename)
     return FileResponse(path)
 
 # simple model listings the UI fills dropdowns with
@@ -503,7 +552,7 @@ def add_builtin_cn_with_aux(
     if in_has("end"):          cn_inputs["end"]   = cn_inputs.pop("end_percent")
     if in_has("cn_mode"):      cn_inputs["cn_mode"] = mode
     if in_has("control_type"): cn_inputs["control_type"] = mode
-    if in_has("preprocess"):   cn_inputs["preprocess"] = True  # if supported, ensure “preprocess” path is chosen
+    if in_has("preprocess"):   cn_inputs["preprocess"] = False  # if supported, ensure “preprocess” path is chosen
 
     g[cn_apply_id] = {"class_type": "ControlNetApplyAdvanced", "inputs": cn_inputs}
 
@@ -512,6 +561,39 @@ def add_builtin_cn_with_aux(
     g[ksampler_id]["inputs"]["positive"] = [cn_apply_id, 0]
     if two_outs and "negative" in g[ksampler_id]["inputs"]:
         g[ksampler_id]["inputs"]["negative"] = [cn_apply_id, 1]
+
+def _first_hist_image(pid: str, timeout_s: int = 45) -> Optional[dict]:
+    """Poll Comfy history for first produced image of this prompt_id."""
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        s, data = comfy_request("GET", f"/history/{pid}")
+        if s == 200 and isinstance(data, dict) and pid in data:
+            outs = data[pid].get("outputs", {}) or {}
+            for _, node in outs.items():
+                for _, arr in node.items():
+                    if isinstance(arr, list):
+                        for it in arr:
+                            if it and it.get("filename"):
+                                return it
+        time.sleep(1.0)
+    return None
+
+def _copy_output_to_input(im: dict) -> Optional[str]:
+    """Copy a saved output image into BASE/input and return a new relative filename."""
+    try:
+        filename   = im["filename"]
+        subfolder  = im.get("subfolder","")
+        src_dir    = os.path.join(BASE, "output", subfolder) if subfolder else os.path.join(BASE, "output")
+        src_path   = os.path.join(src_dir, filename)
+        rel_name   = f"cnproc_{uuid.uuid4().hex}_{os.path.basename(filename)}"
+        dst_path   = os.path.join(BASE, "input", rel_name)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        with open(src_path, "rb") as r, open(dst_path, "wb") as w:
+            w.write(r.read())
+        return rel_name
+    except Exception:
+        return None
+
 
 # -------- Helpers: history load/save --------
 
@@ -589,13 +671,17 @@ def build_ideate(o: Dict[str, Any]) -> Dict[str, Any]:
     c2_pre   = bool(o.get("c2_preprocess", False))
     c2_low   = int(float(o.get("c2_low", 100)))
     c2_high  = int(float(o.get("c2_high",200)))
+    
+    # after reading c1_* and c2_* fields
+    c1_proc_rel = os.path.basename(o.get("c1_proc_rel", "") or o.get("c1_image", "") or "")
+    c2_proc_rel = os.path.basename(o.get("c2_proc_rel", "") or o.get("c2_image", "") or "")
 
     prefix   = (o.get("filename_prefix","ideate_sdxl") or "ideate_sdxl").strip()
 
     # Base graph
     g = {
         "1": {"class_type":"CheckpointLoaderSimple",
-              "inputs":{"ckpt_name": ckpt, "vae_name": vae_opt}},
+              "inputs":{"ckpt_name": ckpt}},
         "2": {"class_type":"CLIPTextEncode",
               "inputs":{"clip":["1",1], "text": prompt}},
         "3": {"class_type":"CLIPTextEncode",
@@ -621,54 +707,65 @@ def build_ideate(o: Dict[str, Any]) -> Dict[str, Any]:
     def _vae_ref():
         return ["10", 0] if "10" in g else ["1", 2]
 
-    # ControlNet plug helper
+    # ---- helper to attach a CN ----
     idx = 20
-    def plug_control(model_name, image_path, weight, start, end, pre, low, high):
+    def plug_control(model_name, image_path, weight, start, end, pre, low, high, *, proc_rel=""):
         nonlocal idx, g
-        if not (model_name and image_path):
+        if not (model_name and (image_path or proc_rel)):
             return
 
+        # prefer preprocessed map if provided
+        chosen_rel = os.path.basename(proc_rel or image_path)
+
+        # loader + image
         g[str(idx)]   = {"class_type": "ControlNetLoader",
                          "inputs": {"control_net_name": model_name}}
         g[str(idx+1)] = {"class_type": "LoadImage",
-                         "inputs": {"image": image_path}}
+                         "inputs": {"image": chosen_rel}}
         image_src_id  = str(idx+1)
 
-        if pre:
+        # only run inline Canny if user ticked it AND there's no preprocessed map
+        if pre and not proc_rel:
             image_src_id = add_canny_pre(g, image_src_id, low, high)
 
-        # Determine ControlNetApplyAdvanced IO names and wire up
+        # wire ApplyAdvanced
         info = _object_info_nodes().get("ControlNetApplyAdvanced", {}) or {}
         inputs_spec  = (info.get("input") or info.get("inputs") or {})
         outputs_spec = (info.get("output") or info.get("outputs") or {})
-        in_keys      = {k.lower() for k in inputs_spec.keys()} if isinstance(inputs_spec, dict) else set()
-        out_keys     = {k.lower() for k in outputs_spec.keys()} if isinstance(outputs_spec, dict) else set()
+        in_keys      = {k.lower() for k in inputs_spec} if isinstance(inputs_spec, dict) else set()
+        out_keys     = {k.lower() for k in outputs_spec} if isinstance(outputs_spec, dict) else set()
 
         cn_inputs = {
             "control_net":   [str(idx), 0],
             "image":         [image_src_id, 0],
-            "strength":      weight,
-            "start_percent": start,
-            "end_percent":   end,
+            "strength":      float(weight),
+            "start_percent": float(start),
+            "end_percent":   float(end),
             "vae":           _vae_ref(),
         }
         if "conditioning" in in_keys:
-            cn_inputs["conditioning"] = ["2", 0]  # use positive if single port
+            cn_inputs["conditioning"] = ["2", 0]   # single-port variant
         else:
             cn_inputs["positive"] = ["2", 0]
             cn_inputs["negative"] = ["3", 0]
 
+        if "start" in in_keys: cn_inputs["start"] = cn_inputs.pop("start_percent")
+        if "end"   in in_keys: cn_inputs["end"]   = cn_inputs.pop("end_percent")
+        if "cn_mode" in in_keys:      cn_inputs["cn_mode"] = model_name
+        if "control_type" in in_keys: cn_inputs["control_type"] = model_name
+        if "preprocess" in in_keys:   cn_inputs["preprocess"] = False
+
         g[str(idx+2)] = {"class_type": "ControlNetApplyAdvanced", "inputs": cn_inputs}
 
-        has_two_conditioning_out = ("negative" in out_keys) or (len(out_keys) >= 2)
+        has_two_out = ("negative" in out_keys) or (len(out_keys) >= 2)
         g["5"]["inputs"]["positive"] = [str(idx+2), 0]
-        g["5"]["inputs"]["negative"] = [str(idx+2), 1] if has_two_conditioning_out else ["3", 0]
+        g["5"]["inputs"]["negative"] = [str(idx+2), 1] if has_two_out else ["3", 0]
 
         idx += 3
 
-    # Plug up to two CNs
-    plug_control(c1_model, c1_img, c1_w, c1_s, c1_e, c1_pre, c1_low, c1_high)
-    plug_control(c2_model, c2_img, c2_w, c2_s, c2_e, c2_pre, c2_low, c2_high)
+    # attach up to two CNs (using preprocessed maps if given)
+    plug_control(c1_model, c1_img, c1_w, c1_s, c1_e, c1_pre, c1_low, c1_high, proc_rel=c1_proc_rel)
+    plug_control(c2_model, c2_img, c2_w, c2_s, c2_e, c2_pre, c2_low, c2_high, proc_rel=c2_proc_rel)
 
     return {"prompt": g}
 
@@ -686,14 +783,23 @@ def _infer_qwen_unet_dtype(unet_name: str):
         return ("fp16", "fp16")
     return ("default", "default")
 
+def _union_cn_filename() -> Optional[str]:
+    """Return the filename Comfy expects for the InstantX Union model if present, else None."""
+    try:
+        fn = "Qwen-Image-InstantX-ControlNet-Union.safetensors"
+        path = os.path.join(CONTROLNET_DIR, fn)
+        return fn if os.path.isfile(path) else None
+    except Exception:
+        return None
+
+
 def build_render(o: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Qwen Image Edit 2509 (image-to-image):
-      LoadImage -> VAE/CLIP(Qwen) -> VAEEncode -> TextEncodeQwenImageEdit (preprocess) ->
-      KSampler (denoise) -> VAEDecode -> Save
-    Optional: UNET override, up to 2 LoRAs, optional built-in ControlNet (edges/depth/keypoints)
-              with a separate CN image.
+    Qwen Image Edit 2509 (image-to-image) with optional CN:
+      - CN is used ONLY if a preprocessed map (cn_proc_rel) is provided.
+      - Prefers InstantX Union; else uses built-in control types.
     """
+    # ---- Core params ----
     prompt    = o.get("prompt", "")
     negative  = o.get("negative", "")
     steps     = int(float(o.get("steps", 5)))
@@ -701,32 +807,28 @@ def build_render(o: Dict[str, Any]) -> Dict[str, Any]:
     denoise   = float(o.get("denoise", 0.40))
     prefix    = (o.get("filename_prefix", "render_qwen") or "render_qwen").strip()
 
-    # Input image must be reachable by ComfyUI LoadImage (we copy to BASE/input in /upload)
-    input_rel = os.path.basename(o.get("input_image", ""))
-    if not input_rel:
-        # Keep validation to the endpoint layer; return a minimal graph that will fail fast if hit directly.
-        input_rel = "MISSING_INPUT.png"
+    # Input image (already copied into BASE/input by /upload)
+    input_rel = os.path.basename(o.get("input_image", "") or "") or "MISSING_INPUT.png"
 
-    # UNET & dtype inference
+    # ---- Qwen Edit 2509 UNET (FP8) ----
     unet_name = (o.get("unet_name") or "qwen_image_edit_2509_fp8_e4m3fn.safetensors").strip()
     _, udtype = _infer_qwen_unet_dtype(unet_name)
 
-    # LoRAs
-    l1, l1s = (o.get("lora1") or "").strip() or "Qwen-Image-Lightning-4steps-V1.0.safetensors", float(o.get("lora1_strength", 1.0))
+    # ---- LoRAs ----
+    l1, l1s = (o.get("lora1") or "Qwen-Image-Lightning-4steps-V1.0.safetensors").strip(), float(o.get("lora1_strength", 1.0))
     l2, l2s = (o.get("lora2") or "").strip(), float(o.get("lora2_strength", 0.0))
 
-    # Base Qwen 2509 edit pipeline
+    # ---- Base Qwen edit pipeline ----
     g = {
-        "1": {"class_type": "LoadImage", "inputs": {"image": input_rel}},
-        "2": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
-        "3": {"class_type": "CLIPLoader", "inputs": {
-            "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
-            "type": "qwen_image", "variant": "default"}},
-        "4": {"class_type": "UNETLoader", "inputs": {
-            "unet_name": unet_name, "weight_dtype": udtype}},
+        "1":  {"class_type": "LoadImage", "inputs": {"image": input_rel}},
+        "2":  {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+        "3":  {"class_type": "CLIPLoader", "inputs": {
+                  "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                  "type": "qwen_image", "variant": "default"}},
+        "4":  {"class_type": "UNETLoader", "inputs": {"unet_name": unet_name, "weight_dtype": udtype}},
     }
 
-    # LoRA chain on the model branch
+    # LoRA chain (model branch)
     model_ref = ["4", 0]
     if l1:
         g["5"] = {"class_type": "LoraLoaderModelOnly",
@@ -737,20 +839,19 @@ def build_render(o: Dict[str, Any]) -> Dict[str, Any]:
                    "inputs": {"model": model_ref, "lora_name": l2, "strength_model": l2s}}
         model_ref = ["12", 0]
 
-    # Robustly map the text field name for the Qwen edit encoder
-    _qwen_nodes = _object_info_nodes()
-    _qie_info   = _qwen_nodes.get("TextEncodeQwenImageEdit", {}) if isinstance(_qwen_nodes, dict) else {}
+    # Text encoder specific to Qwen Edit; negative text via CLIPTextEncode
+    _nodes      = _object_info_nodes()
+    _qie_info   = _nodes.get("TextEncodeQwenImageEdit", {}) if isinstance(_nodes, dict) else {}
     _qie_inputs = (_qie_info.get("input") or _qie_info.get("inputs") or {}) if isinstance(_qie_info, dict) else {}
     _text_field = "text" if "text" in _qie_inputs else ("prompt" if "prompt" in _qie_inputs else "text")
 
     g["6"] = {"class_type": "TextEncodeQwenImageEdit",
-          "inputs": {"clip": ["3", 0], "vae": ["2", 0], "image": ["1", 0], _text_field: prompt}}
-          
-    # Negative conditioning via CLIP
+              "inputs": {"clip": ["3", 0], "vae": ["2", 0], "image": ["1", 0], _text_field: prompt}}
+
     g["7"] = {"class_type": "CLIPTextEncode",
               "inputs": {"clip": ["3", 0], "text": negative}}
 
-    # Latent of input
+    # Encode the input to latents
     g["8"] = {"class_type": "VAEEncode", "inputs": {"pixels": ["1", 0], "vae": ["2", 0]}}
 
     # Sampler
@@ -767,88 +868,99 @@ def build_render(o: Dict[str, Any]) -> Dict[str, Any]:
     g["10"] = {"class_type": "VAEDecode", "inputs": {"samples": ["9", 0], "vae": ["2", 0]}}
     g["11"] = {"class_type": "SaveImage", "inputs": {"images": ["10", 0], "filename_prefix": prefix}}
 
-    # Optional built-in ControlNet for Qwen 2509, using a SEPARATE CN image
-    cn_mode  = (o.get("cn_mode")  or "none").strip().lower()      # edges|depth|keypoints|none
-    cn_image = (o.get("cn_image") or "").strip()
-    cn_w     = float(o.get("cn_strength", 1.0))
-    cn_s     = float(o.get("cn_start", 0.0))
-    cn_e     = float(o.get("cn_end",   1.0))
+    # ---- Optional ControlNet (requires preprocessed map) ----
+    cn_mode     = (o.get("cn_mode") or "none").strip().lower()             # edges|depth|keypoints|none
+    cn_proc_rel = os.path.basename(o.get("cn_proc_rel","") or "")           # set by /cn/preprocess
+    cn_w        = float(o.get("cn_strength", 1.0))
+    cn_s        = float(o.get("cn_start", 0.0))
+    cn_e        = float(o.get("cn_end",   1.0))
 
-    if cn_image and cn_mode in ("edges", "depth", "keypoints"):
-        # Make sure CN image is available under BASE/input (the /upload route already copies there)
-        try:
-            src = os.path.join(BASE, "input", os.path.basename(cn_image))
-            if not os.path.isfile(src):
-                up = os.path.join(UPLOAD_DIR, os.path.basename(cn_image))
-                if os.path.isfile(up):
-                    with open(up, "rb") as r, open(src, "wb") as w:
-                        w.write(r.read())
-        except Exception:
-            pass
+    use_cn = (cn_mode in ("edges","depth","keypoints")) and bool(cn_proc_rel)
+    if use_cn:
+        # Load the PREPROCESSED map and save a preview
+        g["20"] = {"class_type": "LoadImage", "inputs": {"image": cn_proc_rel}}
+        g["21"] = {"class_type": "SaveImage", "inputs": {"images": ["20", 0], "filename_prefix": "cn_preview"}}
 
-        # Load CN image and apply built-in Qwen controlnet to the sampler’s positive branch
-        g["20"] = {"class_type": "LoadImage", "inputs": {"image": os.path.basename(cn_image)}}
-        add_builtin_cn_with_aux(
-            g,
-            vae_id="2",
-            cn_image_id="20",
-            ksampler_id="9",
-            positive_cond_id="6",
-            cn_mode=o.get("cn_mode","none"),
-            cn_strength=float(o.get("cn_strength",1.0)),
-            cn_start=float(o.get("cn_start",0.0)),
-            cn_end=float(o.get("cn_end",1.0)),
-        )
+        # Prefer InstantX Union, else fallback to built-in advanced types
+        union_name = _union_cn_filename()
+        loader_id  = "22"
+        apply_id   = "23"
+
+        if union_name:
+            g[loader_id] = {"class_type":"ControlNetLoader", "inputs":{"control_net_name": union_name}}
+        else:
+            g[loader_id] = {"class_type":"ControlNetLoaderAdvanced", "inputs":{"control_net_name": cn_mode}}
+
+        # Introspect ApplyAdvanced for input aliases
+        info = (_nodes.get("ControlNetApplyAdvanced") or {}) if isinstance(_nodes, dict) else {}
+        ins  = (info.get("input") or info.get("inputs") or {}) if isinstance(info, dict) else {}
+        outs = (info.get("output") or info.get("outputs") or {}) if isinstance(info, dict) else {}
+        in_keys  = {k.lower() for k in ins.keys()} if isinstance(ins, dict) else set()
+        out_keys = {k.lower() for k in outs.keys()} if isinstance(outs, dict) else set()
+
+        cn_inputs = {
+            "control_net":   [loader_id, 0],
+            "image":         ["20", 0],    # preprocessed hint
+            "vae":           ["2", 0],
+            "strength":      cn_w,
+            "start_percent": cn_s,
+            "end_percent":   cn_e,
+        }
+        # conditioning ports
+        if "conditioning" in in_keys:
+            cn_inputs["conditioning"] = ["6", 0]
+        else:
+            cn_inputs["positive"] = ["6", 0]
+            cn_inputs["negative"] = ["7", 0]
+
+        # mode/alias hints
+        if "control_type" in in_keys: cn_inputs["control_type"] = cn_mode
+        if "cn_mode" in in_keys:      cn_inputs["cn_mode"]      = cn_mode
+        if "preprocess" in in_keys:   cn_inputs["preprocess"]   = False  # already preprocessed
+        if "start" in in_keys:        cn_inputs["start"]        = cn_inputs.pop("start_percent")
+        if "end" in in_keys:          cn_inputs["end"]          = cn_inputs.pop("end_percent")
+
+        g[apply_id] = {"class_type":"ControlNetApplyAdvanced", "inputs": cn_inputs}
+
+        # Recommended for Qwen Edit: use CN for positive only; keep plain negative text
+        g["9"]["inputs"]["positive"] = [apply_id, 0]
+        g["9"]["inputs"]["negative"] = ["7", 0]
 
     return {"prompt": g}
 
-# -------- Upscale workflow (SwinIR/ESRGAN class) --------
-
-def build_upscale(path: str, model_name: str, *, prefix: str = "upscaled") -> Dict[str, Any]:
+def _ensure_in_input(path: str) -> str:
     """
-    Simple pixel-space upscaler using a .pth model in models/upscale_models.
-    - model_name: filename in UPSCALE_DIR (e.g., SwinIR .pth)
-    - path: absolute path to input image (we copy uploads into ComfyUI/input already)
+    Return a filename that exists under BASE/input.
+    If an absolute path is provided, copy it into BASE/input and return the new relative name.
     """
-    # Try to resolve to a relative name that Comfy's LoadImage can read
-    # If path is already inside BASE/input, keep its basename.
-    rel_name = os.path.basename(path)
-    if not os.path.isfile(os.path.join(BASE, "input", rel_name)):
-        # best effort copy for Comfy LoadImage
+    if not path:
+        return ""
+    name = os.path.basename(path)
+    dst = os.path.join(BASE, "input", name)
+    if os.path.isabs(path):
         try:
-            os.makedirs(os.path.join(BASE, "input"), exist_ok=True)
-            with open(path, "rb") as r, open(os.path.join(BASE, "input", rel_name), "wb") as w:
-                w.write(r.read())
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(path, dst)
         except Exception:
             pass
+    return name
 
+def build_upscale(path: str, model_name: str, *, prefix: str = "upscaled") -> Dict[str, Any]:
+    rel = _ensure_in_input(path)
     g = {
-        # Load pixels
-        "1": {"class_type": "LoadImage", "inputs": {"image": rel_name}},
-        # Load upscaler model
+        "1": {"class_type": "LoadImage", "inputs": {"image": rel}},
         "2": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": model_name}},
-        # Apply upscaler
         "3": {"class_type": "ImageUpscaleWithModel", "inputs": {"image": ["1", 0], "upscale_model": ["2", 0]}},
-        # Save
         "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0], "filename_prefix": prefix}},
     }
     return {"prompt": g}
 
-
-# -------- Root page (optional) --------
-@app.get("/")
-def root():
-    return {"ok": True, "service": "Simple ComfyUI UI", "models": {
-        "checkpoints": len(list_files(CHECKPOINTS_DIR, (".safetensors", ".ckpt"))),
-        "vae": len(list_files(VAE_DIR, (".safetensors", ".ckpt"))),
-        "upscalers": len(list_files(UPSCALE_DIR, (".pth",))),
-        "unets": len(list_files(DIFFUSION_DIR, (".safetensors", ".ckpt", ".bin"))),
-    }}
 # ---------------- UI ----------------
 # Updated to: (1) fix built-in CN model dropdown bug (no external model list needed),
 # (2) make numeric fields use <input type="number"> with sensible step/min,
 # (3) add a /ui route that serves this HTML directly,
 # (4) tighten progress/log handling, (5) small UX polish.
+# (Plus: ControlNet preprocess flow: upload → preprocess → preview → enforce-before-render)
 
 HTML = '''<!doctype html><html><head><meta charset="utf-8"/>
 <title>Simple ComfyUI WebUI</title>
@@ -978,16 +1090,29 @@ HTML = '''<!doctype html><html><head><meta charset="utf-8"/>
                 <input id="i_c1e" type="number" value="1.0" step="0.05" min="0" max="1">
               </div>
             </div>
-            <div class="row" style="margin-top:6px; align-items:center; gap:8px">
-              <label style="display:flex;align-items:center;gap:8px;margin:0">
-                <input type="checkbox" id="i_c1pre"> Preprocess (Canny)
-              </label>
-              <label for="i_c1low" class="muted" style="margin:0">low</label>
-              <input id="i_c1low" type="number" value="100" style="width:80px" min="0" max="255" step="1">
-              <label for="i_c1high" class="muted" style="margin:0">high</label>
-              <input id="i_c1high" type="number" value="200" style="width:80px" min="0" max="255" step="1">
+
+            <!-- NEW: CN1 preprocess controls -->
+            <div class="row" style="margin-top:8px; align-items:center; gap:8px">
+              <label>Preprocess type</label>
+              <select id="i_c1mode" style="min-width:140px">
+                <option value="none">(none)</option>
+                <option value="edges">Edges</option>
+                <option value="depth">Depth</option>
+                <option value="keypoints">Keypoints</option>
+              </select>
+
+              <span id="i_c1canny_row" class="muted" style="display:none; margin-left:12px">
+                low <input id="i_c1low2"  type="number" value="100" style="width:80px" min="0" max="255" step="1">
+                high <input id="i_c1high2" type="number" value="200" style="width:80px" min="0" max="255" step="1">
+              </span>
+
+              <button class="btn" id="i_c1pre_btn" style="margin-left:auto">Preprocess</button>
             </div>
+            <small id="i_c1pre_note" class="muted"></small>
+            <div id="i_c1proc_prev" class="thumbs"></div>
+
             <hr style="border:none;border-top:1px solid var(--line);margin:12px 0">
+
             <div class="grid g2">
               <div>
                 <label>CN2 model</label>
@@ -1012,15 +1137,26 @@ HTML = '''<!doctype html><html><head><meta charset="utf-8"/>
                 <input id="i_c2e" type="number" value="1.0" step="0.05" min="0" max="1">
               </div>
             </div>
-            <div class="row" style="margin-top:6px; align-items:center; gap:8px">
-              <label style="display:flex;align-items:center;gap:8px;margin:0">
-                <input type="checkbox" id="i_c2pre"> Preprocess (Canny)
-              </label>
-              <label for="i_c2low" class="muted" style="margin:0">low</label>
-              <input id="i_c2low" type="number" value="100" style="width:80px" min="0" max="255" step="1">
-              <label for="i_c2high" class="muted" style="margin:0">high</label>
-              <input id="i_c2high" type="number" value="200" style="width:80px" min="0" max="255" step="1">
+            
+            <!-- NEW: CN2 preprocess controls -->
+            <div class="row" style="margin-top:8px; align-items:center; gap:8px">
+              <label>Preprocess type</label>
+              <select id="i_c2mode" style="min-width:140px">
+                <option value="none">(none)</option>
+                <option value="edges">Edges</option>
+                <option value="depth">Depth</option>
+                <option value="keypoints">Keypoints</option>
+              </select>
+      
+              <span id="i_c2canny_row" class="muted" style="display:none; margin-left:12px">
+                low <input id="i_c2low2"  type="number" value="100" style="width:80px" min="0" max="255" step="1">
+                high <input id="i_c2high2" type="number" value="200" style="width:80px" min="0" max="255" step="1">
+              </span>
+              
+              <button class="btn" id="i_c2pre_btn" style="margin-left:auto">Preprocess</button>
             </div>
+            <small id="i_c2pre_note" class="muted"></small>
+            <div id="i_c2proc_prev" class="thumbs"></div>
           </div>
         </div>
         <p>
@@ -1030,6 +1166,7 @@ HTML = '''<!doctype html><html><head><meta charset="utf-8"/>
         <div id="i_out" class="card"></div>
         <div id="i_imgs" class="thumbs"></div>
       </section>
+
 
       <!-- RENDER (Qwen Image Edit 2509) -->
       <section id="pane_render" style="display:none">
@@ -1100,6 +1237,18 @@ HTML = '''<!doctype html><html><head><meta charset="utf-8"/>
                 <input id="r_cn_e" type="number" value="1.0" step="0.05" min="0" max="1">
               </div>
             </div>
+
+            <!-- NEW: Edges-only canny thresholds + preprocess button -->
+            <div class="row" id="r_canny_row" style="margin-top:8px; align-items:center; gap:8px; display:none">
+              <span class="muted">Canny:</span>
+              <label for="r_canny_low" class="muted" style="margin:0">low</label>
+              <input id="r_canny_low" type="number" value="100" style="width:90px" min="0" max="255" step="1">
+              <label for="r_canny_high" class="muted" style="margin:0">high</label>
+              <input id="r_canny_high" type="number" value="200" style="width:90px" min="0" max="255" step="1">
+              <button class="btn" id="r_cn_pre_btn" style="margin-left:auto">Preprocess</button>
+            </div>
+            <small id="r_cn_pre_note" class="muted"></small>
+
             <div id="r_cn_processed" class="thumbs"></div>
           </div>
         </div>
@@ -1153,6 +1302,13 @@ let ws=null, wsConnected=false, currentPID=null;
 let uploadedUpscale = null;
 let lastTab = "ideate";
 
+// Track if CN has been preprocessed for current input/mode
+let rCnPreprocessed = false;
+let rCnProcessedRel = ""; // server-returned comfy-relative filename (goes into r_cn_image)
+
+let iC1Preprocessed = false, iC1ProcRel = "";
+let iC2Preprocessed = false, iC2ProcRel = "";
+
 function log(...args){
   const box=document.getElementById('uilog');
   const line=document.createElement('div'); line.className='logline';
@@ -1182,16 +1338,20 @@ function tab(which){
   if(which==="history"){ loadHist(); }
 }
 
-async function fetchJSON(url){ const r=await fetch(url); return r.json(); }
+async function fetchJSON(url, opts){ const r=await fetch(url, opts); return r.json(); }
 
 async function loadIdeateModels(){
   const ck = await fetchJSON('/models/checkpoints');
   const va = await fetchJSON('/models/vae');
   const cn = await fetchJSON('/models/controlnets');
+
+  const builtins = new Set(['edges','depth','keypoints']);
+  const diskOnly = (cn.models || []).filter(m => !builtins.has(m));
+
   fillSelect('i_ckpt', ck.models);
   fillSelect('i_vae',  [''].concat(va.models));
-  fillSelect('i_c1m',  [''].concat(cn.models));
-  fillSelect('i_c2m',  [''].concat(cn.models));
+  fillSelect('i_c1m',  [''].concat(diskOnly));
+  fillSelect('i_c2m',  [''].concat(diskOnly));
   log('Loaded models for Ideate');
 }
 async function loadUpscalers(){
@@ -1278,61 +1438,74 @@ async function uploadTo(pathFieldId, fileInputId, previewId, noteId){
   prev.appendChild(img);
   const note=document.getElementById(noteId); if(note) note.textContent=j.path;
   log('Uploaded', fileInputId, '->', j.path);
+  // any upload changes invalidate preprocessing state
+  rCnPreprocessed = false; rCnProcessedRel = "";
+  document.getElementById('r_cn_pre_note')?.textContent = '';
+  document.getElementById('r_cn_processed').innerHTML = '';
   return j;
 }
 
+function requireCnPreprocessedIfNeeded(){
+  const mode = (document.getElementById('r_cn_mode')?.value || 'none');
+  if (mode === 'none') return true;
+  if (!val('r_cn_image')) return false;
+  return rCnPreprocessed; // must preprocess first
+}
+
 async function fireIdeate(){
-  ensureWS(); showProgressCard(true);
-  const overrides={
+  ensureWS();
+  showProgressCard(true);
+
+  const overrides = {
     prompt: val('i_prompt'), negative: val('i_negative'),
     steps: val('i_steps'), cfg: val('i_cfg'),
     width: val('i_w'), height: val('i_h'),
     sampler: val('i_sampler'), scheduler: val('i_sched'),
     seed: val('i_seed'), ckpt: val('i_ckpt'), vae: val('i_vae'),
+
     c1_model: val('i_c1m'), c1_image: val('i_c1img'),
     c1_weight: val('i_c1w'), c1_start: val('i_c1s'), c1_end: val('i_c1e'),
-    c1_preprocess: document.getElementById('i_c1pre').checked, c1_low: val('i_c1low'), c1_high: val('i_c1high'),
+
     c2_model: val('i_c2m'), c2_image: val('i_c2img'),
     c2_weight: val('i_c2w'), c2_start: val('i_c2s'), c2_end: val('i_c2e'),
-    c2_preprocess: document.getElementById('i_c2pre').checked, c2_low: val('i_c2low'), c2_high: val('i_c2high'),
-    filename_prefix: val('i_prefix')
-  };
-  log('POST /ideate', overrides);
-  const run = async ()=>{
-    const r = await fetch('/ideate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:clientId,overrides})});
-    const t = await r.text(); document.getElementById('i_out').textContent=t;
-    log('ideate response', t.slice(0,200));
-    try{ const j=JSON.parse(t); if(j.prompt_id){ pollForImages(j.prompt_id,'i_imgs','ideate',overrides); return true; } }catch(e){}
-    showProgressCard(false); return false;
-  };
-  return withBtnFeedback('btnIdeate','i_notice', run);
-}
 
-async function fireRender(){
-  ensureWS(); showProgressCard(true);
-  const overrides={
-    prompt: val('r_prompt'), negative: val('r_negative'),
-    steps: val('r_steps'), cfg: val('r_cfg'), denoise: val('r_denoise'),
-    input_image: val('r_in'),
-    lora1: val('r_l1'), lora1_strength: val('r_l1s'),
-    lora2: val('r_l2'), lora2_strength: val('r_l2s'),
-    filename_prefix: val('r_prefix'),
-    unet_name: val('r_unet'),
-    cn_mode: document.getElementById('r_cn_mode')?.value || 'none',
-    cn_image: val('r_cn_image'),
-    cn_strength: val('r_cn_w'),
-    cn_start: val('r_cn_s'),
-    cn_end: val('r_cn_e'),
+    filename_prefix: val('i_prefix'),
+
+    // NEW: ideate CN preprocess selections + results
+    c1_mode: document.getElementById('i_c1mode')?.value || 'none',
+    c1_low: document.getElementById('i_c1low2')?.value || '100',
+    c1_high: document.getElementById('i_c1high2')?.value || '200',
+    c1_proc_rel: iC1ProcRel,
+
+    c2_mode: document.getElementById('i_c2mode')?.value || 'none',
+    c2_low: document.getElementById('i_c2low2')?.value || '100',
+    c2_high: document.getElementById('i_c2high2')?.value || '200',
+    c2_proc_rel: iC2ProcRel,
   };
-  log('POST /render', overrides);
+
+  log('POST /ideate', overrides);
+
   const run = async ()=>{
-    const r = await fetch('/render',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({client_id:clientId,overrides})});
-    const t = await r.text(); document.getElementById('r_out').textContent=t;
-    log('render response', t.slice(0,200));
-    try{ const j=JSON.parse(t); if(j.prompt_id){ pollForImages(j.prompt_id,'r_imgs','render',overrides); return true; } }catch(e){}
-    showProgressCard(false); return false;
+    const r = await fetch('/ideate', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ client_id: clientId, overrides })
+    });
+    const t = await r.text();
+    document.getElementById('i_out').textContent = t;
+    log('ideate response', t.slice(0,200));
+    try {
+      const j = JSON.parse(t);
+      if (j.prompt_id){
+        pollForImages(j.prompt_id, 'i_imgs', 'ideate', overrides);
+        return true;
+      }
+    } catch(_) {}
+    showProgressCard(false);
+    return false;
   };
-  return withBtnFeedback('btnRender','r_notice', run);
+
+  return withBtnFeedback('btnIdeate','i_notice', run);
 }
 
 async function fireUpscale(){
@@ -1349,6 +1522,70 @@ async function fireUpscale(){
     showProgressCard(false); return false;
   };
   return withBtnFeedback('btnUpscale','u_notice', run);
+}
+
+async function fireRender(){
+  ensureWS();
+  showProgressCard(true);
+
+  // if CN type selected, make sure the map was preprocessed first
+  if (!requireCnPreprocessedIfNeeded()){
+    document.getElementById('r_notice').innerHTML =
+      '<span class="err">Please preprocess the ControlNet image first (click "Preprocess").</span>';
+    showProgressCard(false);
+    return;
+  }
+
+  const overrides = {
+    // core
+    prompt:        val('r_prompt'),
+    negative:      val('r_negative'),
+    steps:         val('r_steps'),
+    cfg:           val('r_cfg'),
+    denoise:       val('r_denoise'),
+    unet_name:     val('r_unet'),
+    filename_prefix: val('r_prefix'),
+
+    // input image
+    input_image:   val('r_in'),
+
+    // ControlNet (built-in) — uses preprocessed map if available
+    cn_mode:       (document.getElementById('r_cn_mode')?.value || 'none'),
+    cn_proc_rel:   (rCnProcessedRel || val('r_cn_image') || ''),
+    cn_strength:   val('r_cn_w'),
+    cn_start:      val('r_cn_s'),
+    cn_end:        val('r_cn_e'),
+
+    // LoRAs
+    lora1:        val('r_l1'),
+    lora1_strength: val('r_l1s'),
+    lora2:        val('r_l2'),
+    lora2_strength: val('r_l2s'),
+  };
+
+  log('POST /render', overrides);
+
+  const run = async ()=>{
+    const r = await fetch('/render', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ client_id: clientId, overrides })
+    });
+    const t = await r.text();
+    document.getElementById('r_out').textContent = t;
+    log('render response', t.slice(0,200));
+    try{
+      const j = JSON.parse(t);
+      if (j.prompt_id){
+        pollForImages(j.prompt_id, 'r_imgs', 'render', overrides);
+        return true;
+      }
+    }catch(_){}
+    showProgressCard(false);
+    return false;
+  };
+
+  return withBtnFeedback('btnRender','r_notice', run);
 }
 
 async function pollForImages(pid, targetId, tabName, overrides){
@@ -1390,16 +1627,19 @@ async function pollForImages(pid, targetId, tabName, overrides){
           if (targetId === 'r_imgs') {
             const cnBox = document.getElementById('r_cn_processed');
             if (cnBox) {
-              cnBox.innerHTML = '';
+              // also pull out any cn_preview saved during render (fallback)
               const cnItems = imgs.filter(im => (im.filename || '').includes('cn_preview'));
-              for (const im of cnItems) {
-                const url = '/view?filename=' + encodeURIComponent(im.filename)
-                          + '&type=' + encodeURIComponent(im.type || 'output')
-                          + '&subfolder=' + encodeURIComponent(im.subfolder || '')
-                          + '&t=' + Date.now();
-                const cnImg = document.createElement('img');
-                cnImg.src = url; cnImg.loading = 'lazy'; cnImg.decoding = 'async';
-                cnBox.appendChild(cnImg);
+              if (cnItems.length){
+                cnBox.innerHTML = '';
+                for (const im of cnItems) {
+                  const url = '/view?filename=' + encodeURIComponent(im.filename)
+                            + '&type=' + encodeURIComponent(im.type || 'output')
+                            + '&subfolder=' + encodeURIComponent(im.subfolder || '')
+                            + '&t=' + Date.now();
+                  const cnImg = document.createElement('img');
+                  cnImg.src = url; cnImg.loading = 'lazy'; cnImg.decoding = 'async';
+                  cnBox.appendChild(cnImg);
+                }
               }
             }
           }
@@ -1424,20 +1664,198 @@ async function onFileChange_map(toFieldId, fileInputId, previewId, noteId){
   await uploadTo(toFieldId, fileInputId, previewId, noteId);
 }
 
+// ---------- CN preprocess UI wiring ----------
+function updateCannyRowVisibility(){
+  const mode = (document.getElementById('r_cn_mode')?.value || 'none');
+  const row = document.getElementById('r_canny_row');
+  if (row) row.style.display = (mode === 'edges') ? 'flex' : 'none';
+  // changing mode invalidates preprocess
+  rCnPreprocessed = false; rCnProcessedRel = "";
+  document.getElementById('r_cn_pre_note')?.textContent = '';
+  document.getElementById('r_cn_processed').innerHTML = '';
+}
+document.getElementById('r_cn_mode').addEventListener('change', updateCannyRowVisibility);
+
+async function preprocessIdeateCN(slot){
+  const modeSel = document.getElementById(slot===1 ? 'i_c1mode' : 'i_c2mode');
+  const imgField = document.getElementById(slot===1 ? 'i_c1img'  : 'i_c2img');
+  const note = document.getElementById(slot===1 ? 'i_c1pre_note' : 'i_c2pre_note');
+  const prev = document.getElementById(slot===1 ? 'i_c1proc_prev' : 'i_c2proc_prev');
+
+  const mode = (modeSel?.value || 'none');
+  const imgPath = imgField?.value || '';
+  if (mode === 'none'){ note.textContent = 'Pick a preprocess type first.'; return; }
+  if (!imgPath){ note.textContent = 'Upload or choose an image first.'; return; }
+
+  const low = parseInt(document.getElementById(slot===1 ? 'i_c1low2'  : 'i_c2low2')?.value || '100', 10);
+  const high= parseInt(document.getElementById(slot===1 ? 'i_c1high2' : 'i_c2high2')?.value || '200', 10);
+
+  try{
+    note.textContent = 'Preprocessing…';
+    const j = await fetchJSON('/cn/preprocess', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        cn_mode: mode,
+        cn_image: imgPath,
+        canny_low: low,
+        canny_high: high
+      })
+    });
+    if (!j || !j.ok){ note.innerHTML = '<span class="err">Preprocess failed.</span>'; return; }
+
+    const rel = j.cn_proc_rel || '';
+    if (slot===1){ iC1ProcRel = rel; iC1Preprocessed = !!rel; }
+    else         { iC2ProcRel = rel; iC2Preprocessed = !!rel; }
+
+    // show preview
+    prev.innerHTML = '';
+    if (j.preview_url){
+      const im = document.createElement('img');
+      im.src = j.preview_url + '&t=' + Date.now();
+      im.loading = 'lazy'; im.decoding = 'async';
+      prev.appendChild(im);
+    }
+    note.innerHTML = '<span class="ok">Preprocessed ✔</span>';
+    log('Ideate CN preprocess result', {slot, j});
+  }catch(e){
+    note.innerHTML = '<span class="err">Preprocess error.</span>';
+    logErr(e?.message || e);
+  }
+}
+
+async function preprocessCN(){
+  const mode = (document.getElementById('r_cn_mode')?.value || 'none');
+  const imgPath = val('r_cn_image');
+  const note = document.getElementById('r_cn_pre_note');
+  if (mode === 'none'){ note.textContent = 'Pick a ControlNet type first.'; return; }
+  if (!imgPath){ note.textContent = 'Upload or choose a CN image first.'; return; }
+
+  const payload = {
+    cn_mode: mode,
+    cn_image: imgPath,
+    canny_low: parseInt(val('r_canny_low') || '100', 10),
+    canny_high: parseInt(val('r_canny_high') || '200', 10)
+  };
+  try{
+    note.textContent = 'Preprocessing…';
+    const j = await fetchJSON('/cn/preprocess', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (!j || !j.ok){
+      note.innerHTML = '<span class="err">Preprocess failed.</span>';
+      return;
+    }
+    // Replace CN input with processed result
+    rCnProcessedRel = j.cn_proc_rel || '';
+    if (rCnProcessedRel){
+      setVal('r_cn_image', rCnProcessedRel);
+      rCnPreprocessed = true;
+    }
+    // Show preview image
+    const box = document.getElementById('r_cn_processed');
+    if (box){
+      box.innerHTML = '';
+      if (j.preview_url){
+        const im = document.createElement('img');
+        im.src = j.preview_url + '&t=' + Date.now();
+        im.loading = 'lazy'; im.decoding = 'async';
+        box.appendChild(im);
+      }
+    }
+    note.innerHTML = '<span class="ok">Preprocessed ✔ (wired to workflow)</span>';
+    log('CN preprocess result', j);
+  }catch(e){
+    note.innerHTML = '<span class="err">Preprocess error.</span>';
+    logErr(e?.message || e);
+  }
+}
+
+document.getElementById('r_cn_pre_btn').addEventListener('click', preprocessCN);
+
+// invalidate preprocess state if user edits the CN image path manually
+document.getElementById('r_cn_image').addEventListener('input', ()=>{
+  rCnPreprocessed = false; rCnProcessedRel = "";
+  document.getElementById('r_cn_pre_note')?.textContent = '';
+  document.getElementById('r_cn_processed').innerHTML = '';
+});
+
+// -------- existing listeners --------
 document.getElementById('btnIdeate').addEventListener('click', fireIdeate);
 document.getElementById('btnRender').addEventListener('click', fireRender);
 document.getElementById('btnUpscale').addEventListener('click', fireUpscale);
 
-document.getElementById('i_c1file').addEventListener('change', ()=>onFileChange_map('i_c1img','i_c1file','i_c1prev','i_c1note'));
-document.getElementById('i_c2file').addEventListener('change', ()=>onFileChange_map('i_c2img','i_c2file','i_c2prev','i_c2note'));
+/* ===== IDEATE/RENDER CN helpers & listeners (attach once) ===== */
 
-document.getElementById('r_in_file').addEventListener('change', ()=>onFileChange_map('r_in','r_in_file','r_in_prev','r_in_note'));
-document.getElementById('r_cn_file').addEventListener('change', ()=>onFileChange_map('r_cn_image','r_cn_file','r_cn_prev','r_cn_note'));
+// Show Canny threshold inputs for Ideate only when mode === 'edges'
+function updateICannyVisibility(){
+  const m1 = (document.getElementById('i_c1mode')?.value || 'none');
+  const m2 = (document.getElementById('i_c2mode')?.value || 'none');
+  const r1 = document.getElementById('i_c1canny_row');
+  const r2 = document.getElementById('i_c2canny_row');
+  if (r1) r1.style.display = (m1 === 'edges') ? 'inline-flex' : 'none';
+  if (r2) r2.style.display = (m2 === 'edges') ? 'inline-flex' : 'none';
+}
 
-document.getElementById('u_file').addEventListener('change', async ()=>{
+// Reset/prep state for one Ideate CN slot (1 or 2)
+function resetIdeateCn(slot){
+  if (slot === 1){
+    iC1Preprocessed = false; iC1ProcRel = "";
+    const n1 = document.getElementById('i_c1pre_note'); if (n1) n1.textContent = '';
+    const p1 = document.getElementById('i_c1proc_prev'); if (p1) p1.innerHTML = '';
+  } else {
+    iC2Preprocessed = false; iC2ProcRel = "";
+    const n2 = document.getElementById('i_c2pre_note'); if (n2) n2.textContent = '';
+    const p2 = document.getElementById('i_c2proc_prev'); if (p2) p2.innerHTML = '';
+  }
+  updateICannyVisibility();
+}
+
+// tiny helper: add listener only if the element exists
+const on = (id, ev, cb) => { const el = document.getElementById(id); if (el) el.addEventListener(ev, cb); };
+
+// --- Upscale upload
+on('u_file', 'change', async ()=>{
   const r = await uploadTo('u_path','u_file','u_preview','u_file_note');
-  if (r) { uploadedUpscale = r; }
+  if (r) uploadedUpscale = r;
 });
+
+// --- Ideate: mode changes invalidate preprocessing + toggle canny rows
+on('i_c1mode', 'change', ()=>resetIdeateCn(1));
+on('i_c2mode', 'change', ()=>resetIdeateCn(2));
+
+// --- Ideate: changing image path invalidates preprocessing
+on('i_c1img', 'input', ()=>resetIdeateCn(1));
+on('i_c2img', 'input', ()=>resetIdeateCn(2));
+
+// --- Ideate: preprocess buttons
+on('i_c1pre_btn', 'click', ()=>preprocessIdeateCN(1));
+on('i_c2pre_btn', 'click', ()=>preprocessIdeateCN(2));
+
+// --- Ideate: file pickers → preview + wire path, then reset state
+on('i_c1file', 'change', async ()=>{
+  await onFileChange_map('i_c1img','i_c1file','i_c1prev','i_c1note');
+  resetIdeateCn(1);
+});
+on('i_c2file', 'change', async ()=>{
+  await onFileChange_map('i_c2img','i_c2file','i_c2prev','i_c2note');
+  resetIdeateCn(2);
+});
+
+// --- Render: file pickers
+on('r_in_file', 'change', ()=>onFileChange_map('r_in','r_in_file','r_in_prev','r_in_note'));
+on('r_cn_file', 'change', async ()=>{
+  await onFileChange_map('r_cn_image','r_cn_file','r_cn_prev','r_cn_note');
+  // invalidate CN preprocess state
+  rCnPreprocessed = false; rCnProcessedRel = "";
+  const note = document.getElementById('r_cn_pre_note'); if (note) note.textContent = '';
+  const box = document.getElementById('r_cn_processed'); if (box) box.innerHTML = '';
+});
+
+// initial sync for the Ideate Canny rows
+updateICannyVisibility();
 
 async function loadHist(){
   const box = document.getElementById('h_list');
@@ -1470,19 +1888,13 @@ async function loadHist(){
 }
 
 tab('ideate');
+updateCannyRowVisibility();
+updateICannyVisibility();
 log('UI ready');
 </script>
 </main>
 </body></html>
 '''
-
-# Serve the UI directly at /ui (root stays JSON health unless you prefer otherwise)
-from fastapi.responses import HTMLResponse
-
-# Basic healthcheck so you (and RunPod) can probe the service
-@app.get("/health")
-def health():
-    return {"ok": True}
 
 # Serve the HTML UI that’s already stored in the HTML variable above
 @app.get("/ui", response_class=HTMLResponse)
