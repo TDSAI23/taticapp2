@@ -1911,4 +1911,26 @@ cd "$BASE/simple-ui"
 "$VENV/bin/pip" show uvicorn fastapi >/dev/null || "$VENV/bin/pip" install --no-input fastapi uvicorn python-multipart
 nohup "$VENVPY" -m uvicorn app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
 
+# --- Optional: public URL via Cloudflare Tunnel ---
+if ! command -v cloudflared >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+  apt-get update -y || true
+  apt-get install -y cloudflared || true
+fi
+
+if command -v cloudflared >/dev/null 2>&1; then
+  # Tunnel the FastAPI UI (9999); ComfyUI stays internal on 8188
+  nohup cloudflared tunnel --url http://127.0.0.1:9999 --no-autoupdate \
+    >/workspace/runpod-slim/cf.log 2>&1 &
+
+  # Print the public URL once it appears
+  for i in {1..20}; do
+    URL=$(grep -m1 -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /workspace/runpod-slim/cf.log || true)
+    if [ -n "$URL" ]; then
+      echo "🌐 Cloudflare URL: $URL"
+      break
+    fi
+    sleep 1
+  done
+fi
+
 echo "ComfyUI running on :8188, UI running on :9999"
