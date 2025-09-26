@@ -1908,29 +1908,34 @@ nohup "$VENVPY" main.py --listen 0.0.0.0 --port 8188 >"$LOG" 2>&1 &
 
 # --- Start FastAPI UI ---
 cd "$BASE/simple-ui"
-"$VENV/bin/pip" show uvicorn fastapi >/dev/null || "$VENV/bin/pip" install --no-input fastapi uvicorn python-multipart
-nohup "$VENVPY" -m uvicorn app:app --host 0.0.0.0 --port 9999 >/workspace/runpod-slim/ui.log 2>&1 &
+"$VENV/bin/pip" show uvicorn fastapi >/dev/null || \
+  "$VENV/bin/pip" install --no-input fastapi uvicorn python-multipart
+nohup "$VENVPY" -m uvicorn app:app --host 0.0.0.0 --port 9999 --proxy-headers --forwarded-allow-ips="*" \
+  >/workspace/runpod-slim/ui.log 2>&1 &
 
-# --- Optional: public URL via Cloudflare Tunnel ---
-if ! command -v cloudflared >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-  apt-get update -y || true
-  apt-get install -y cloudflared || true
+# --- Install cloudflared (apt repo) ---
+if ! command -v cloudflared >/dev/null 2>&1; then
+  install -d /usr/share/keyrings
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+    | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] \
+https://pkg.cloudflare.com/cloudflared jammy main" \
+    | tee /etc/apt/sources.list.d/cloudflared.list
+  apt-get update
+  apt-get install -y cloudflared
 fi
 
-if command -v cloudflared >/dev/null 2>&1; then
-  # Tunnel the FastAPI UI (9999); ComfyUI stays internal on 8188
-  nohup cloudflared tunnel --url http://127.0.0.1:9999 --no-autoupdate \
-    >/workspace/runpod-slim/cf.log 2>&1 &
+# --- Start Cloudflare tunnel for FastAPI UI (9999) ---
+nohup cloudflared tunnel --url http://127.0.0.1:9999 --no-autoupdate \
+  >/workspace/runpod-slim/cf.log 2>&1 &
 
-  # Print the public URL once it appears
-  for i in {1..20}; do
-    URL=$(grep -m1 -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /workspace/runpod-slim/cf.log || true)
-    if [ -n "$URL" ]; then
-      echo "🌐 Cloudflare URL: $URL"
-      break
-    fi
-    sleep 1
-  done
+# Print the public URL
+sleep 2
+URL=$(grep -m1 -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /workspace/runpod-slim/cf.log || true)
+if [ -n "$URL" ]; then
+  echo "🌐 Cloudflare URL: $URL"
+else
+  echo "⚠️ Cloudflare URL not yet available — check /workspace/runpod-slim/cf.log"
 fi
 
 echo "ComfyUI running on :8188, UI running on :9999"
