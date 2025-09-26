@@ -34,12 +34,11 @@ if [ ! -x "$VENV/bin/python" ]; then
   python3 -m venv "$VENV"
 fi
 
-# --- Base Python tooling + ComfyUI requirements ---
-$PIP install --upgrade pip setuptools wheel
-$PIP install --no-input fastapi uvicorn websockets piexif opencv-python python-multipart
+# --- ComfyUI requirements only (base deps already installed in Start) ---
 if [ -f "$BASE/requirements.txt" ]; then
   $PIP install --no-input -r "$BASE/requirements.txt"
 fi
+
 
 # --- Ensure custom_nodes dir exists ---
 mkdir -p "$BASE/custom_nodes"
